@@ -1,0 +1,5 @@
+python -m pip install -U tibiawikisql
+python -m tibiawikisql generate --skip-images
+python -m pip install requests beautifulsoup4
+python generate_outfits.py
+python generate_npcs.py
