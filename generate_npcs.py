@@ -2,7 +2,8 @@ import os
 import re
 import json
 import sqlite3
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
+import xml.etree.ElementTree as ET
 
 from tibiawikisql.models.npc import Npc
 from tibiawikisql.models.item import Item
@@ -15,15 +16,28 @@ OUTPUT_ROOT = "output"
 
 # Optional outfit mapping file (NPC name -> outfit dict)
 OUTFITS_JSON = "outfits.json"
+OUTFITS_XML = "outfits.xml"
 
 # Default outfit if none is found for an NPC in outfits.json
-DEFAULT_OUTFIT = {
+DEFAULT_OUTFIT_MALE = {
     "type": 130,  # mage male
     "head": 19,
     "body": 86,
     "legs": 87,
     "feet": 95,
     "addons": 0,
+    "sex": "male",
+}
+
+# Rough female variant for fallback when no explicit outfit is known
+DEFAULT_OUTFIT_FEMALE = {
+    "type": 138,  # mage female
+    "head": 19,
+    "body": 86,
+    "legs": 87,
+    "feet": 95,
+    "addons": 0,
+    "sex": "female",
 }
 
 
@@ -83,22 +97,91 @@ def load_outfits(path: str) -> Dict[str, Dict[str, Any]]:
     return {k.lower(): v for k, v in data.items()}
 
 
+def load_outfits_xml(path: str) -> Dict[Tuple[str, str], int]:
+    """
+    Build a mapping (outfit_name.lower(), sex) -> looktype from outfits.xml.
+    Sex: 'female' for type="0", 'male' for type="1".
+    """
+    mapping: Dict[Tuple[str, str], int] = {}
+    if not os.path.exists(path):
+        return mapping
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+    for outfit in root.findall("outfit"):
+        name = outfit.attrib.get("name")
+        looktype = outfit.attrib.get("looktype")
+        sex_type = outfit.attrib.get("type")
+        if not name or looktype is None or sex_type is None:
+            continue
+        sex = "female" if sex_type == "0" else "male"
+        try:
+            mapping[(name.strip().lower(), sex)] = int(looktype)
+        except ValueError:
+            continue
+    return mapping
+
+
+def normalize_gender(gender: Optional[str]) -> Optional[str]:
+    if not gender:
+        return None
+    gender = gender.strip().lower()
+    if gender.startswith("f"):
+        return "female"
+    if gender.startswith("m"):
+        return "male"
+    return None
+
+
+def default_outfit_for_gender(gender: Optional[str]) -> Dict[str, Any]:
+    if gender == "female":
+        return DEFAULT_OUTFIT_FEMALE.copy()
+    return DEFAULT_OUTFIT_MALE.copy()
+
+
 def get_outfit_for_npc(
-    npc_name: str, outfits: Dict[str, Dict[str, Any]]
+    npc_name: str,
+    npc_gender: Optional[str],
+    outfits: Dict[str, Dict[str, Any]],
+    xml_lookup: Dict[Tuple[str, str], int],
 ) -> Dict[str, Any]:
     """
     Return outfit dict for the NPC:
     - if present in outfits.json (case-insensitive), use that
-    - otherwise use DEFAULT_OUTFIT
+    - otherwise use a gender-aware default
+    After merging, try to map to outfits.xml by outfit_name/sex to obtain the
+    correct looktype for the current server outfits configuration.
     """
+    gender = normalize_gender(npc_gender)
     key = npc_name.lower()
-    if key in outfits:
-        outfit = outfits[key]
-        # ensure all needed keys are present; fill missing from default
-        result = DEFAULT_OUTFIT.copy()
-        result.update(outfit)
-        return result
-    return DEFAULT_OUTFIT
+    base = default_outfit_for_gender(gender)
+
+    if key not in outfits:
+        base["sex"] = base.get("sex") or gender or "unknown"
+        return base
+
+    outfit = outfits[key]
+    result = base.copy()
+    result.update(outfit)
+    # Ensure sex is set and prefer the NPC gender when available
+    result["sex"] = normalize_gender(result.get("sex")) or gender or base.get("sex") or "unknown"
+
+    # Map to server looktype via outfits.xml if possible
+    outfit_name = result.get("outfit_name")
+    sex_key = result["sex"]
+    looktype = None
+    if outfit_name:
+        looktype = xml_lookup.get((outfit_name.lower(), sex_key))
+        if looktype is None:
+            # Fallback: try the opposite sex if not found under requested one
+            looktype = xml_lookup.get((outfit_name.lower(), "male")) or xml_lookup.get(
+                (outfit_name.lower(), "female")
+            )
+
+    if looktype is not None:
+        result["type"] = looktype
+
+    return result
 
 
 def build_shop_value(entries: List[Tuple[str, int, int]]) -> str:
@@ -268,6 +351,7 @@ def main():
 
     # Load optional outfits.json
     outfits_map = load_outfits(OUTFITS_JSON)
+    outfits_xml_map = load_outfits_xml(OUTFITS_XML)
 
     # Connect to tibiawiki.db
     conn = sqlite3.connect(DB_PATH)
@@ -292,27 +376,27 @@ def main():
         npc_dir, scripts_dir, shops_dir = ensure_city_dirs(city_slug)
 
         # Outfit
-        outfit = get_outfit_for_npc(npc_name, outfits_map)
+        outfit = get_outfit_for_npc(npc_name, npc.gender, outfits_map, outfits_xml_map)
 
         # Build shop entries using NPC offers and Item.client_id
-        buyable_entries: List[Tuple[str, int, int]] = []  # NPC sells to player
-        sellable_entries: List[Tuple[str, int, int]] = []  # NPC buys from player
+        buyable_entries: List[Tuple[str, int, int]] = []  # Player sells to NPC (NPC buys)
+        sellable_entries: List[Tuple[str, int, int]] = []  # Player buys from NPC (NPC sells)
 
-        # NPC SELL offers = items you can BUY from NPC
+        # NPC SELL offers = items player can BUY from NPC
         for offer in npc.sell_offers or []:
             item = Item.get_one_by_field(conn, "article_id", offer.item_id)
             if not item or item.client_id is None:
                 continue
             item_name = (item.actual_name or item.name or offer.item_title).lower()
-            buyable_entries.append((item_name, item.client_id, offer.value))
+            sellable_entries.append((item_name, item.client_id, offer.value))
 
-        # NPC BUY offers = items you can SELL to NPC
+        # NPC BUY offers = items player can SELL to NPC
         for offer in npc.buy_offers or []:
             item = Item.get_one_by_field(conn, "article_id", offer.item_id)
             if not item or item.client_id is None:
                 continue
             item_name = (item.actual_name or item.name or offer.item_title).lower()
-            sellable_entries.append((item_name, item.client_id, offer.value))
+            buyable_entries.append((item_name, item.client_id, offer.value))
 
         has_shop = bool(buyable_entries or sellable_entries)
 
